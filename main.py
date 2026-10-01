@@ -1,46 +1,46 @@
-from fastapi import FastAPI, Request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, CallbackQueryHandler
 import logging
-import os
-import requests
+import random
+import string
 import time
+import urllib.parse
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
-BOT_VERSION = "v4.0.0-Final"
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8780623348:AAFfxePY9dJiWxkbsI8rne9XXWaNIwTdvjA")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "Studikitez_bot")
+BOT_TOKEN = "8780623348:AAFfxePY9dJiWxkbsI8rne9XXWaNIwTdvjA"
 CHANNEL_USERNAME = "@studikitesz"
 
-# Firebase (Studiki) - For saving user login data
-FIREBASE_API_KEY = "AIzaSyCG2zFEsE5Fr8Vx-5of_PL0xQeP773MNFM"
-FIREBASE_PROJECT_ID = "studiki"
+# Firebase: Studiki (User Profiles)
+STUDIKI_API_KEY = "AIzaSyCG2zFEsE5Fr8Vx-5of_PL0xQeP773MNFM"
+STUDIKI_PROJECT = "studiki"
 
-# OTP Gateway Worker
-OTP_GATEWAY_URL = "https://otp-gateway-api.avnishrajurkar6.workers.dev"
+# Firebase: Smexgod (Key Minting)
+SMEXGOD_API_KEY = "AIzaSyAzxBCRdwK4NIyGwkzBrV9ev_53MJIfsOM"
+SMEXGOD_PROJECT = "smexgod"
 
-# Temporary storage for OTP sessions (In production, use Redis or Firestore)
-# Format: { telegram_user_id: {"session_id": "...", "mobile": "..."} }
+# Workers
+OTP_WORKER = "https://otp-gateway-api.avnishrajurkar6.workers.dev"
+PROXY_WORKER = "https://studi-proxy.avnishrajurkar6.workers.dev"
+BATCHES_URL = "https://studikitesz.pages.dev/batches.json"
+
+# In-memory OTP session store
 PENDING_OTP = {}
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
-logger = logging.getLogger("studikitez")
-
-app = FastAPI()
-application = Application.builder().token(BOT_TOKEN).build()
+logger = logging.getLogger(__name__)
 
 # ==============================================================================
 # FIREBASE HELPERS
 # ==============================================================================
 def get_firebase_user(telegram_id: int) -> dict:
-    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/users/{telegram_id}?key={FIREBASE_API_KEY}"
+    url = f"https://firestore.googleapis.com/v1/projects/{STUDIKI_PROJECT}/databases/(default)/documents/users/{telegram_id}?key={STUDIKI_API_KEY}"
     try:
         res = requests.get(url, timeout=5)
         if res.status_code == 200:
-            data = res.json()
-            fields = data.get("fields", {})
+            fields = res.json().get("fields", {})
             return {
                 "mobile": fields.get("mobile", {}).get("stringValue", ""),
                 "verified": fields.get("verified", {}).get("booleanValue", False),
@@ -51,7 +51,7 @@ def get_firebase_user(telegram_id: int) -> dict:
     return None
 
 def save_firebase_user(telegram_id: int, mobile: str, token: str):
-    url = f"https://firestore.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/databases/(default)/documents/users/{telegram_id}?key={FIREBASE_API_KEY}"
+    url = f"https://firestore.googleapis.com/v1/projects/{STUDIKI_PROJECT}/databases/(default)/documents/users/{telegram_id}?key={STUDIKI_API_KEY}"
     payload = {
         "fields": {
             "telegramId": {"integerValue": str(telegram_id)},
@@ -63,51 +63,67 @@ def save_firebase_user(telegram_id: int, mobile: str, token: str):
     }
     try:
         res = requests.patch(url, json=payload, timeout=5)
-        if res.status_code in [200, 204]:
-            logger.info(f"Successfully saved user {telegram_id} to Firebase")
-            return True
-        logger.error(f"Firebase PATCH failed: {res.status_code} - {res.text}")
+        return res.status_code in [200, 204]
     except Exception as e:
         logger.error(f"Firebase PATCH error: {e}")
     return False
 
+def mint_play_key() -> tuple:
+    key = f"SB-{''.join(random.choices(string.digits + string.ascii_lowercase, k=4)).upper()}-{''.join(random.choices(string.digits + string.ascii_lowercase, k=4)).upper()}"
+    device_id = f"dev_{''.join(random.choices(string.digits + string.ascii_lowercase, k=6))}"
+    now_ms = int(time.time() * 1000)
+    payload = {
+        "fields": {
+            "createdAt": {"integerValue": str(now_ms)},
+            "expiresAt": {"integerValue": str(now_ms + 2 * 24 * 60 * 60 * 1000)},
+            "status": {"stringValue": "active"},
+            "maxDevices": {"integerValue": "1"},
+            "registeredDevices": {"arrayValue": {"values": [{"stringValue": device_id}]}}
+        }
+    }
+    url = f"https://firestore.googleapis.com/v1/projects/{SMEXGOD_PROJECT}/databases/(default)/documents/valid_keys?key={SMEXGOD_API_KEY}&documentId={key}"
+    try:
+        res = requests.post(url, json=payload, timeout=5)
+        if res.status_code in [200, 201]:
+            return key, device_id
+    except Exception as e:
+        logger.error(f"Key minting error: {e}")
+    return None, None
+
 # ==============================================================================
-# ACCESS CONTROL (The Core Logic You Requested)
+# ACCESS CONTROL
 # ==============================================================================
 async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Returns True if user is in channel AND logged in. Sends prompts and returns False otherwise."""
     user_id = update.effective_user.id
     target = update.callback_query if update.callback_query else update.message
 
-    # 1. Check Community Membership
+    # 1. Check Community
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         if member.status not in ["member", "administrator", "creator"]:
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}"),
-                InlineKeyboardButton("✅ I Have Joined", callback_data="retry_access")
+                InlineKeyboardButton("📢 Join Channel", url="https://t.me/studikitesz"),
+                InlineKeyboardButton("✅ I Joined", callback_data="retry_access")
             ]])
-            await target.edit_message_text(
-                "🔒 <b>Community Access Required</b>\n\nYou must be a member of @studikitesz to use this bot.",
-                reply_markup=kb, parse_mode="HTML"
-            ) if update.callback_query else await target.reply_text(
-                "🔒 <b>Community Access Required</b>\n\nYou must be a member of @studikitesz to use this bot.",
-                reply_markup=kb, parse_mode="HTML"
-            )
+            text = "🔒 <b>Community Access Required</b>\n\nYou must be a member of @studikitesz to use this bot."
+            if update.callback_query:
+                await target.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+            else:
+                await target.reply_text(text, reply_markup=kb, parse_mode="HTML")
             return False
-    except Exception as e:
-        logger.error(f"Channel check failed: {e}")
-        await target.edit_message_text("⚠️ Bot cannot verify channel. Ensure the bot is an Admin in @studikitesz.") if update.callback_query else await target.reply_text("⚠️ Bot cannot verify channel. Ensure the bot is an Admin in @studikitesz.")
+    except Exception:
+        await target.reply_text("⚠️ Bot cannot verify channel. Ensure the bot is an Admin in @studikitesz.")
         return False
 
-    # 2. Check Firebase Login Status
+    # 2. Check Login
     user_data = get_firebase_user(user_id)
     if not user_data or not user_data.get("verified"):
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🌐 Open Web Login", url="https://studikitesz.pages.dev/login.html")
-        ]])
-        msg = "🔑 <b>Login Required</b>\n\nYou are a community member, but you must log in to access content.\n\nUse <code>/login &lt;phone&gt;</code> or click below."
-        await target.edit_message_text(msg, reply_markup=kb, parse_mode="HTML") if update.callback_query else await target.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Open Web Login", url="https://studikitesz.pages.dev/login.html")]])
+        text = "🔑 <b>Login Required</b>\n\nYou are a community member, but you must log in.\n\nUse <code>/login &lt;phone&gt;</code> or click below."
+        if update.callback_query:
+            await target.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+        else:
+            await target.reply_text(text, reply_markup=kb, parse_mode="HTML")
         return False
 
     return True
@@ -115,14 +131,13 @@ async def check_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bo
 async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📚 Browse Batches", callback_data="menu_batches")],
-        [InlineKeyboardButton("👤 My Profile", callback_data="menu_profile")],
-        [InlineKeyboardButton("💎 Premium", callback_data="menu_premium")]
+        [InlineKeyboardButton("👤 My Profile", callback_data="menu_profile")]
     ])
-    msg = "🎉 <b>Welcome to StudiKitEZ!</b>\n\nYou are verified and logged in. Choose an option below:"
+    text = "🎉 <b>Welcome to StudiKitEZ!</b>\n\nYou are verified and logged in. Choose an option:"
     if update.callback_query:
-        await update.callback_query.edit_message_text(msg, reply_markup=kb, parse_mode="HTML")
+        await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
     else:
-        await update.message.reply_text(msg, reply_markup=kb, parse_mode="HTML")
+        await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
 
 # ==============================================================================
 # COMMANDS
@@ -132,166 +147,204 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_main_menu(update, context)
 
 async def vme_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Explicitly verifies community membership, then checks login."""
     user_id = update.effective_user.id
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
         if member.status in ["member", "administrator", "creator"]:
             await update.message.reply_text("✅ <b>Verified!</b> You are a member of @studikitesz.", parse_mode="HTML")
-            # Now check login
             user_data = get_firebase_user(user_id)
             if user_data and user_data.get("verified"):
                 await update.message.reply_text("✅ You are also logged in. Opening main menu...")
                 await show_main_menu(update, context)
             else:
                 kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 Open Web Login", url="https://studikitesz.pages.dev/login.html")]])
-                await update.message.reply_text("🔑 Now, please log in to access content:\nUse <code>/login &lt;phone&gt;</code> or click below.", reply_markup=kb, parse_mode="HTML")
+                await update.message.reply_text("🔑 Now, please log in:\nUse <code>/login &lt;phone&gt;</code> or click below.", reply_markup=kb, parse_mode="HTML")
         else:
             await update.message.reply_text(f"❌ You are not a member of {CHANNEL_USERNAME}. Please join first.")
     except Exception:
         await update.message.reply_text("⚠️ Cannot verify. Make sure the bot is an admin in the channel.")
 
 async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await check_access(update, context):
-        return
+    if not await check_access(update, context): return
     if not context.args:
-        await update.message.reply_text("Usage: <code>/login &lt;10-digit-phone-number&gt;</code>", parse_mode="HTML")
-        return
+        await update.message.reply_text("Usage: <code>/login &lt;10-digit-phone&gt;</code>", parse_mode="HTML"); return
     
     mobile = context.args[0].strip()
     if len(mobile) != 10 or not mobile.isdigit():
-        await update.message.reply_text("❌ Invalid phone number. Must be exactly 10 digits.")
-        return
+        await update.message.reply_text("❌ Invalid phone number. Must be exactly 10 digits."); return
 
     user_id = update.effective_user.id
     await update.message.reply_text("⏳ Requesting OTP...")
     
-    payload = {"mobile": mobile, "provider": "nexttoppers", "channel": "sms"}
     try:
-        res = requests.post(f"{OTP_GATEWAY_URL}/api/otp/send", json=payload, timeout=10)
+        res = requests.post(f"{OTP_WORKER}/api/otp/send", json={"mobile": mobile, "provider": "nexttoppers", "channel": "sms"}, timeout=10)
         data = res.json()
         if data.get("success"):
             PENDING_OTP[user_id] = {"session_id": data["session_id"], "mobile": mobile}
-            await update.message.reply_text(f"✅ OTP sent to {mobile}!\n\nReply with the 6-digit OTP or use <code>/verify &lt;otp&gt;</code> to complete login.", parse_mode="HTML")
+            await update.message.reply_text(f"✅ OTP sent to {mobile}!\n\nUse <code>/verify &lt;6-digit-otp&gt;</code> to complete.", parse_mode="HTML")
         else:
-            await update.message.reply_text(f"❌ Failed: {data.get('error', 'Unknown error')}")
+            await update.message.reply_text(f"❌ Failed: {data.get('error', 'Unknown')}")
     except Exception as e:
         await update.message.reply_text(f"❌ Network error: {e}")
 
 async def verify_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not await check_access(update, context):
-        return
+    if not await check_access(update, context): return
     if user_id not in PENDING_OTP:
-        await update.message.reply_text("❌ No pending OTP request. Use <code>/login &lt;phone&gt;</code> first.", parse_mode="HTML")
-        return
-        
+        await update.message.reply_text("❌ No pending OTP. Use <code>/login &lt;phone&gt;</code> first.", parse_mode="HTML"); return
     if not context.args:
-        await update.message.reply_text("Usage: <code>/verify &lt;6-digit-otp&gt;</code>", parse_mode="HTML")
-        return
+        await update.message.reply_text("Usage: <code>/verify &lt;6-digit-otp&gt;</code>", parse_mode="HTML"); return
         
     otp = context.args[0].strip()
     session = PENDING_OTP.pop(user_id)
     
-    payload = {"session_id": session["session_id"], "otp": otp}
     await update.message.reply_text("⏳ Verifying OTP...")
     try:
-        res = requests.post(f"{OTP_GATEWAY_URL}/api/otp/verify", json=payload, timeout=10)
+        res = requests.post(f"{OTP_WORKER}/api/otp/verify", json={"session_id": session["session_id"], "otp": otp}, timeout=10)
         data = res.json()
         if data.get("success"):
             token = data.get("data", {}).get("token") or data.get("token") or "verified"
-            # SAVE TO FIREBASE
             if save_firebase_user(user_id, session["mobile"], token):
-                await update.message.reply_text(f"🎉 <b>Login Successful!</b>\n\nYour account is now linked and saved. Opening main menu...", parse_mode="HTML")
+                await update.message.reply_text("🎉 <b>Login Successful!</b> Profile saved to Firebase. Opening menu...", parse_mode="HTML")
                 await show_main_menu(update, context)
             else:
-                await update.message.reply_text("⚠️ OTP verified, but failed to save to database. Please try again.")
+                await update.message.reply_text("⚠️ OTP verified, but failed to save to Firebase.")
         else:
             await update.message.reply_text(f"❌ Verification failed: {data.get('error', 'Invalid OTP')}")
     except Exception as e:
         await update.message.reply_text(f"❌ Network error: {e}")
 
+# ==============================================================================
+# CALLBACKS (Courses & Content)
+# ==============================================================================
 async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
     if query.data == "retry_access":
-        # Re-run access check
         await query.edit_message_text("⏳ Checking...")
         if await check_access(update, context):
             await show_main_menu(update, context)
         return
 
-    if not await check_access(update, context):
-        return
+    if not await check_access(update, context): return
+
+    user_id = query.from_user.id
 
     if query.data == "menu_batches":
-        await query.edit_message_text("📚 <b>Batches</b>\n\nFetching available courses...", parse_mode="HTML")
-        # Add your batch fetching logic here
-        await query.edit_message_text("📚 <b>Batches</b>\n\n(Example) 1. Class 12th Foundation\n2. NEET Booster", parse_mode="HTML")
+        await query.edit_message_text("⏳ Fetching batches...")
+        try:
+            res = requests.get(BATCHES_URL, timeout=10)
+            data = res.json()
+            batches = data.get("new", []) + data.get("old", [])
+            if not batches:
+                await query.edit_message_text("No batches found.")
+                return
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"📦 {b.get('title', 'Unknown')}", callback_data=f"course:{b.get('id')}")] for b in batches[:10]
+            ])
+            kb.inline_keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_main")])
+            await query.edit_message_text("📚 <b>Select a batch:</b>", reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {e}")
+
+    elif query.data.startswith("course:"):
+        course_id = query.data.split(":")[1]
+        await query.edit_message_text("⏳ Loading folders...")
+        try:
+            url = f"{PROXY_WORKER}/nt/nig?content={course_id}&folder=0"
+            res = requests.get(url, timeout=10)
+            data = res.json()
+            if data.get("success") and data.get("data"):
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"📁 {item.get('title', 'Folder')}", callback_data=f"folder:{course_id}:{item.get('entity_id')}")] 
+                    for item in data["data"] if item.get("type") == "folder"
+                ])
+                kb.inline_keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="menu_batches")])
+                await query.edit_message_text(f"📂 <b>Course {course_id}</b>", reply_markup=kb, parse_mode="HTML")
+            else:
+                await query.edit_message_text("⚠️ No folders found or API error.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {e}")
+
+    elif query.data.startswith("folder:"):
+        _, course_id, folder_id = query.data.split(":")
+        await query.edit_message_text("⏳ Loading files...")
+        try:
+            url = f"{PROXY_WORKER}/nt/nig?content={course_id}&folder={folder_id}"
+            res = requests.get(url, timeout=10)
+            data = res.json()
+            if data.get("success") and data.get("data"):
+                kb = []
+                for item in data["data"]:
+                    if item.get("type") == "folder":
+                        kb.append([InlineKeyboardButton(f"📁 {item.get('title')}", callback_data=f"folder:{course_id}:{item.get('entity_id')}")])
+                    elif item.get("type") == "file":
+                        kb.append([InlineKeyboardButton(f"🎬 {item.get('title')}", callback_data=f"file:{course_id}:{item.get('entity_id')}")])
+                kb.append([InlineKeyboardButton("🔙 Back", callback_data=f"course:{course_id}")])
+                await query.edit_message_text("📂 <b>Folder Contents</b>", reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+            else:
+                await query.edit_message_text("⚠️ No files found or API error.")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {e}")
+
+    elif query.data.startswith("file:"):
+        _, course_id, content_id = query.data.split(":")
+        await query.edit_message_text("⏳ Minting key and fetching content...")
+        
+        # 1. Mint Key
+        key, device_id = mint_play_key()
+        if not key:
+            await query.edit_message_text("❌ Failed to generate playback key.")
+            return
+
+        # 2. Fetch Content
+        try:
+            url = f"{PROXY_WORKER}/nt/play?content_id={content_id}&course_id={course_id}&key={key}&device_id={device_id}"
+            res = requests.get(url, timeout=15)
+            data = res.json()
+            
+            if data.get("decryptedData") and data["decryptedData"].get("file_url"):
+                file_url = data["decryptedData"]["file_url"]
+                title = data["decryptedData"].get("title", "Content")
+                
+                # 3. Update Firebase Status (Optional: log that user accessed this)
+                # (You can expand this to save progress)
+                
+                kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to Folder", callback_data=f"folder:{course_id}:{content_id}")]]) # Simplified back
+                await query.edit_message_text(
+                    f"🎉 <b>{title}</b>\n\n<a href='{file_url}'>▶️ Click here to Open/Play</a>\n\n<i>Tip: If it's an .m3u8 link, use VLC Player.</i>",
+                    reply_markup=kb, parse_mode="HTML", disable_web_page_preview=True
+                )
+            else:
+                await query.edit_message_text(f"❌ API rejected key or no content found. (Status: {res.status_code})")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Fetch error: {e}")
+
     elif query.data == "menu_profile":
-        user_data = get_firebase_user(query.from_user.id)
+        user_data = get_firebase_user(user_id)
         mobile = user_data.get("mobile", "Unknown") if user_data else "Unknown"
-        await query.edit_message_text(f"👤 <b>My Profile</b>\n\nTelegram ID: <code>{query.from_user.id}</code>\nMobile: <code>{mobile}</code>\nStatus: ✅ Verified & Logged In", parse_mode="HTML")
-    elif query.data == "menu_premium":
-        await query.edit_message_text("💎 <b>Premium</b>\n\nPremium features coming soon!", parse_mode="HTML")
-
-async def ver_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"🤖 <b>StudiKitEZ Bot</b>\n📦 Version: <code>{BOT_VERSION}</code>\n✅ Platform: Vercel (FastAPI Webhook)\n🔒 Auth: Firebase + OTP Gateway", parse_mode="HTML")
+        await query.edit_message_text(f"👤 <b>My Profile</b>\n\nTelegram ID: <code>{user_id}</code>\nMobile: <code>{mobile}</code>\nStatus: ✅ Verified & Logged In", parse_mode="HTML")
+        
+    elif query.data == "menu_main":
+        await show_main_menu(update, context)
 
 # ==============================================================================
-# REGISTER HANDLERS
+# MAIN EXECUTION
 # ==============================================================================
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("vme", vme_command))
-application.add_handler(CommandHandler("login", login_command))
-application.add_handler(CommandHandler("verify", verify_command))
-application.add_handler(CommandHandler("ver", ver_command))
-application.add_handler(CallbackQueryHandler(button_click))
+def main():
+    logger.info("Starting StudiKitEZ Bot (Polling Mode)...")
+    app = Application.builder().token(BOT_TOKEN).build()
 
-# ==============================================================================
-# VERCEL WEBHOOK ROUTES
-# ==============================================================================
-@app.on_event("startup")
-async def startup_event():
-    await application.initialize()
-    await application.start()
-    vercel_url = os.getenv("VERCEL_URL", "")
-    if vercel_url:
-        webhook_url = f"https://{vercel_url}/api/webhook"
-        await application.bot.set_webhook(webhook_url)
-        logger.info(f"✅ Webhook set to: {webhook_url}")
-    else:
-        logger.warning("⚠️ VERCEL_URL not set. Webhook not configured.")
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("vme", vme_command))
+    app.add_handler(CommandHandler("login", login_command))
+    app.add_handler(CommandHandler("verify", verify_command))
+    app.add_handler(CallbackQueryHandler(button_click))
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    await application.stop()
-    await application.shutdown()
+    logger.info("✅ Bot is running and polling for updates!")
+    # drop_pending_updates=True prevents spamming old messages on restart
+    app.run_polling(drop_pending_updates=True)
 
-@app.post("/api/webhook")
-async def webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.de_json(data, application.bot)
-        await application.process_update(update)
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return {"ok": False, "error": str(e)}
-
-@app.get("/api/setwebhook")
-async def set_webhook_manual():
-    vercel_url = os.getenv("VERCEL_URL", "")
-    if not vercel_url:
-        return {"error": "VERCEL_URL environment variable not set in Vercel Dashboard"}
-    webhook_url = f"https://{vercel_url}/api/webhook"
-    try:
-        res = await application.bot.set_webhook(webhook_url)
-        return {"ok": True, "webhook": webhook_url, "result": res}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-@app.get("/")
-def health():
-    return {"status": "alive", "version": BOT_VERSION}
+if __name__ == "__main__":
+    main()
